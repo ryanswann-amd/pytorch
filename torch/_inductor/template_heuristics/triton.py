@@ -1211,6 +1211,73 @@ def _origami_rank_flex_fwd(
         return None
 
 
+# Decode is memory-bound (q_len=1, split-KV streaming), so the largest block_n
+# typically wins. Origami's prefill attention model applies an LDS/RF capacity
+# check that drops large block_n at high head_dim (e.g. block_n=128 at
+# head_dim>=128) -- which does not apply to the decode kernel. Force-include
+# these block_n so top-K always retains the (usually optimal) large tile.
+_GFX942_DECODE_FORCE_BLOCK_N: dict[int, int] = {128: 128, 256: 128}
+
+
+def _origami_rank_flex_decode(
+    head_dim: int, dtype: Any, candidates: list[FlexDecodeConfig]
+) -> Optional[list[FlexDecodeConfig]]:
+    """Rank FlexAttention *decode* candidates by Origami's attention cost model
+    and return the top-K (config.rocm.origami_topk).
+
+    Decode configs vary only ``block_n`` (the KV tile). Origami ranks block_n at a
+    representative decode problem (q_len=1, ``TORCHINDUCTOR_ORIGAMI_DECODE_KV``
+    kv_len); a gfx942 calibration force-includes large block_n that Origami's
+    prefill LDS check wrongly drops. Returns ``None`` (=> stock behavior) if
+    Origami is unavailable or raises.
+    """
+    if not candidates:
+        return None
+    try:
+        import origami
+    except Exception:
+        return None
+    try:
+        kv_len = int(os.environ.get("TORCHINDUCTOR_ORIGAMI_DECODE_KV", "4096"))
+        q_heads = int(os.environ.get("TORCHINDUCTOR_ORIGAMI_FLEX_HEADS", "32"))
+        batch = int(os.environ.get("TORCHINDUCTOR_ORIGAMI_DECODE_BATCH", "8"))
+        dt = origami.string_to_datatype(_ORIGAMI_DTYPE_STR.get(dtype, "bf16"))
+        hw = origami.get_hardware_for_device(0)
+
+        problem = origami.problem_t()
+        problem.size = origami.dim3_t(1, kv_len, head_dim)  # M=q_len(decode), N=kv_len, K=head_dim
+        problem.batch = batch
+        problem.q_heads = q_heads
+        problem.a_transpose = origami.transpose_t.N
+        problem.b_transpose = origami.transpose_t.N
+        problem.a_dtype = problem.b_dtype = problem.c_dtype = dt
+        problem.d_dtype = problem.mi_dtype = dt
+        problem.a_mx_block_size = problem.b_mx_block_size = 0
+        mi = hw.get_recommended_matrix_instruction(dt)
+
+        block_ns = sorted({c.block_n for c in candidates})
+        ocfgs = []
+        for bn in block_ns:
+            oc = origami.config_t()
+            oc.mt = origami.dim3_t(16, bn, head_dim)  # M-tile small for decode
+            oc.mi = mi
+            oc.occupancy = 1
+            ocfgs.append(oc)
+        ranked = origami.rank_configs(problem, hw, ocfgs, origami.model_t.attention)
+        order = {r.config.mt.n: i for i, r in enumerate(ranked)}
+
+        # Calibration: force the large block_n Origami's LDS check dropped.
+        forced = _GFX942_DECODE_FORCE_BLOCK_N.get(head_dim)
+        if forced is not None and forced in block_ns:
+            order[forced] = -1
+
+        ordered = sorted(candidates, key=lambda c: order.get(c.block_n, 1 << 30))
+        topk = config.rocm.origami_topk
+        return ordered[:topk] if topk and topk > 0 else ordered
+    except Exception:
+        return None
+
+
 class ROCmConfigHeuristic(BaseConfigHeuristic):
     """
     Child class for ROCm specific gemm/flex attention/conv/ configs.
@@ -1550,8 +1617,22 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
 
         if config.max_autotune:
             if config.max_autotune_flex_search_space == "EXHAUSTIVE":
-                return self.exhaustive_flex_decode_configs
-            flex_decode_configs += self.flex_decode_autotune_configs
+                candidates: list[FlexDecodeConfig] = list(
+                    self.exhaustive_flex_decode_configs
+                )
+            else:
+                candidates = list(self.flex_decode_autotune_configs)
+
+            # Origami: prune the decode autotune candidate set to its top-K
+            # block_n configs (gated by config.rocm.origami).
+            if config.rocm.origami:
+                ranked = _origami_rank_flex_decode(head_dim, dtype, candidates)
+                if ranked:
+                    return ranked
+
+            if config.max_autotune_flex_search_space == "EXHAUSTIVE":
+                return candidates
+            flex_decode_configs += candidates
 
         default_config = ROCmFlexDecodeConfig(64, 1, 4)
 
