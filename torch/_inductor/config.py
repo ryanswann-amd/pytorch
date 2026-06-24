@@ -2055,6 +2055,17 @@ class rocm:
     # Currently RCR and F16 only
     use_preselected_instances: bool = False
 
+    # Use the Origami analytical kernel-selection model to prune the FlexAttention
+    # autotune candidate set to its top-K configs (ROCm only). Mirrors the in-tree
+    # Origami GEMM selector: Origami ranks the candidate tiles analytically, then
+    # Inductor's max-autotune benchmarks only the surviving top-K. Requires the
+    # `origami` package (with attention model support) to be importable.
+    origami: bool = os.environ.get("TORCHINDUCTOR_ROCM_ORIGAMI") == "1"
+
+    # Number of top-ranked configs Origami keeps for the FlexAttention autotune
+    # search. Smaller => faster compile, larger => closer to full max-autotune.
+    origami_topk: int = int(os.environ.get("TORCHINDUCTOR_ROCM_ORIGAMI_TOPK", "6"))
+
     # List to determine kBatch parameters to sweep over. By default, we calculate one in splitK
     # scenarios, and run on kBatch=1 in non-splitK scenarios
     kBatch_sweep: Optional[list[int]] = None

@@ -1107,6 +1107,110 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
         return flex_decode_configs
 
 
+_ORIGAMI_DTYPE_STR = {
+    torch.bfloat16: "bf16",
+    torch.float16: "f16",
+    torch.float32: "f32",
+}
+
+# Exhaustive-sweep-calibrated tile overrides for head dims where Origami's raw
+# attention model mis-selects on gfx942: it over-shrinks the tile at large head
+# dims (D=256 -> 64x32/w2, ~0.81 efficiency), but 128x64/w1 is the measured
+# optimum across swept shapes. head_dim -> (block_m, block_n, waves_per_eu).
+_GFX942_FLEX_TILE_OVERRIDES: dict[int, tuple[int, int, int]] = {256: (128, 64, 1)}
+
+
+def _flex_num_warps(block_m: int) -> int:
+    # Aligned with AITER's tuned gfx942 MHA configs (128x64 -> 4, 256x64 -> 8).
+    return 8 if block_m >= 256 else 4
+
+
+def _origami_rank_flex_fwd(
+    head_dim: int, dtype: Any, candidates: list[FlexConfig]
+) -> Optional[list[FlexConfig]]:
+    """Build an Origami-ranked FlexAttention fwd candidate set and return the
+    top-K (config.rocm.origami_topk).
+
+    Generates a tile space, ranks tiles via Origami's attention cost model
+    (``model_t.attention``), seeds the gfx942-calibrated best config (the
+    occupancy/LDS layer Origami's model lacks on gfx942), and keeps the top-K.
+    Inductor's flex heuristic only exposes (head_dim, dtype), so a representative
+    problem (``TORCHINDUCTOR_ORIGAMI_FLEX_SEQ`` / ``..._FLEX_HEADS``) is used; the
+    chosen tile is empirically seq-stable for seq>=512. Returns ``None`` (=> stock
+    behavior) if Origami is unavailable or raises.
+    """
+    try:
+        import origami
+    except Exception:
+        return None
+    try:
+        seq = int(os.environ.get("TORCHINDUCTOR_ORIGAMI_FLEX_SEQ", "4096"))
+        q_heads = int(os.environ.get("TORCHINDUCTOR_ORIGAMI_FLEX_HEADS", "32"))
+        dt = origami.string_to_datatype(_ORIGAMI_DTYPE_STR.get(dtype, "bf16"))
+        hw = origami.get_hardware_for_device(0)
+
+        problem = origami.problem_t()
+        problem.size = origami.dim3_t(seq, seq, head_dim)
+        problem.batch = 1
+        problem.q_heads = q_heads
+        problem.a_transpose = origami.transpose_t.N
+        problem.b_transpose = origami.transpose_t.N
+        problem.a_dtype = problem.b_dtype = problem.c_dtype = dt
+        problem.d_dtype = problem.mi_dtype = dt
+        problem.a_mx_block_size = problem.b_mx_block_size = 0
+        mi = hw.get_recommended_matrix_instruction(dt)
+
+        # Candidate tile space (mirrors the validated adaptive_attn space).
+        tiles = [(bm, bn) for bm in (32, 64, 128) for bn in (32, 64, 128)]
+        ocfgs = []
+        for bm, bn in tiles:
+            oc = origami.config_t()
+            oc.mt = origami.dim3_t(bm, bn, head_dim)
+            oc.mi = mi
+            oc.occupancy = 1
+            ocfgs.append(oc)
+        ranked = origami.rank_configs(problem, hw, ocfgs, origami.model_t.attention)
+        order = {(r.config.mt.m, r.config.mt.n): i for i, r in enumerate(ranked)}
+
+        # gfx942 calibration: promote the override tile + build the seed config
+        # (the occupancy choice Origami's gfx942 model does not make).
+        seed: Optional[ROCmFlexConfig] = None
+        if head_dim in _GFX942_FLEX_TILE_OVERRIDES:
+            bm, bn, waves = _GFX942_FLEX_TILE_OVERRIDES[head_dim]
+            order[(bm, bn)] = -1
+            seed = ROCmFlexConfig(bm, bn, 1, _flex_num_warps(bm), waves_per_eu=waves)
+        elif ranked:
+            bm, bn = ranked[0].config.mt.m, ranked[0].config.mt.n
+            fits = origami.att_check_lds_capacity(
+                hw, origami.dim3_t(bm, bn, head_dim), dt
+            )
+            seed = ROCmFlexConfig(
+                bm, bn, 1, _flex_num_warps(bm), waves_per_eu=2 if fits else 1
+            )
+
+        # Full config space (waves x warps variants) ordered by Origami tile rank.
+        space = [
+            ROCmFlexConfig(bm, bn, 1, nw, waves_per_eu=w)
+            for bm, bn in tiles
+            for w in (1, 2)
+            for nw in (4, 8)
+        ]
+        ordered = sorted(space, key=lambda c: order.get((c.block_m, c.block_n), 1 << 30))
+
+        out: list[FlexConfig] = []
+        seen: set[tuple[int, int, int, int]] = set()
+        for c in ([seed] if seed is not None else []) + ordered:
+            key = (c.block_m, c.block_n, c.waves_per_eu, c.num_warps)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(c)
+        topk = config.rocm.origami_topk
+        return out[:topk] if topk and topk > 0 else out
+    except Exception:
+        return None
+
+
 class ROCmConfigHeuristic(BaseConfigHeuristic):
     """
     Child class for ROCm specific gemm/flex attention/conv/ configs.
@@ -1376,8 +1480,22 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
 
         if config.max_autotune:
             if config.max_autotune_flex_search_space == "EXHAUSTIVE":
-                return self.exhaustive_flex_attn_fwd_configs
-            flex_attn_fwd_configs += self.flex_attn_fwd_autotune_configs
+                candidates: list[FlexConfig] = list(self.exhaustive_flex_attn_fwd_configs)
+            else:
+                candidates = list(self.flex_attn_fwd_autotune_configs)
+
+            # Origami: prune the autotune candidate set to its analytically top-K
+            # configs (gated by config.rocm.origami). Origami ranks the candidate
+            # tiles via its attention cost model; max-autotune then benchmarks only
+            # the survivors. Falls through to stock behavior if unavailable.
+            if config.rocm.origami:
+                ranked = _origami_rank_flex_fwd(head_dim, dtype, candidates)
+                if ranked:
+                    return ranked
+
+            if config.max_autotune_flex_search_space == "EXHAUSTIVE":
+                return candidates
+            flex_attn_fwd_configs += candidates
 
         if head_dim <= 256:
             if dtype == torch.float32:
